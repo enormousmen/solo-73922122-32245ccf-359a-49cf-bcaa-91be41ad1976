@@ -6,11 +6,17 @@
  *   deliver   → 按编号进入交付区（颜色即所走链路）
  *   packet_discard → 标记丢弃
  *   handover_* / send_blocked / stream_done → 写入事件日志与总览
+ *
+ * 长时延（≤60s）场景下，后端跳过空刻度并把连续窗口满压缩成
+ * blocked_spans（首/末受阻刻度）。本文件额外渲染一条“紧凑时间线”：
+ * 红带 = 受阻时段、阶梯条 = 窗口占用、竖线 = 切换节点、游标尺同步回放，
+ * 并显示引擎实际处理的刻度数。
  */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
 const CAP = window.NEW_LINK_CAP;
+const TICK_MS = 50;
 
 let result = null;          // 最近一次模拟结果
 let rafId = null;           // requestAnimationFrame 句柄
@@ -38,6 +44,19 @@ const ATTEMPT_TEXT = {
   "old-resend": "旧链补发",
 };
 
+// ------------------------------------------------------------ 工具
+function fmtMs(ms) {
+  const v = Math.round(Number(ms) || 0);
+  if (Math.abs(v) < 1000) return v + "ms";
+  const s = v / 1000;
+  return (Math.round(s * 100) / 100) + "s";
+}
+
+function pctOf(ms) {
+  const total = Math.max(1, result ? result.max_ts : 1);
+  return Math.max(0, Math.min(100, 100 * ms / total));
+}
+
 // ------------------------------------------------------------ 预置 & 表单
 document.querySelectorAll(".preset-btn").forEach((btn) => {
   btn.addEventListener("click", () => {
@@ -46,6 +65,7 @@ document.querySelectorAll(".preset-btn").forEach((btn) => {
     $("#delay_l2_ms").value = p.delay_l2_ms;
     $("#deadline_ms").value = p.deadline_ms;
     $("#moving_stream").value = String(p.moving_stream);
+    if (p.packets_per_stream) $("#packets_per_stream").value = p.packets_per_stream;
   });
 });
 
@@ -89,7 +109,7 @@ $("#cfg-form").addEventListener("submit", async (e) => {
     }
     result = data;
     setupScene();
-    play();
+    play(0);
     $("#replay-btn").disabled = false;
   } catch (err) {
     const box = $("#form-error");
@@ -101,7 +121,14 @@ $("#cfg-form").addEventListener("submit", async (e) => {
 });
 
 $("#replay-btn").addEventListener("click", () => {
-  if (result) { setupScene(); play(); }
+  if (result) { setupScene(); play(0); }
+});
+
+// 点击受阻时段列表 → 跳到该时段起点继续播放
+$("#span-list").addEventListener("click", (e) => {
+  const chip = e.target.closest(".span-chip");
+  if (!chip || !result) return;
+  jumpTo(Number(chip.dataset.startMs || 0));
 });
 
 // ------------------------------------------------------------ 场景搭建
@@ -112,8 +139,8 @@ function setupScene() {
   blockedSeqs = new Set();
   heldOffsetMap.clear();
 
-  ["#overview-card", "#lanes-card", "#delivery-card", "#log-card", "#checks-card"]
-    .forEach((s) => $(s).hidden = false);
+  ["#overview-card", "#compact-card", "#lanes-card", "#delivery-card",
+   "#log-card", "#checks-card"].forEach((s) => $(s).hidden = false);
 
   const cfg = result.config;
   $("#clock-total").textContent = result.max_ts + " ms";
@@ -125,11 +152,17 @@ function setupScene() {
     : mv.handover_outcome === "rollback"
       ? '<span class="badge rollback">超时回退</span>'
       : '<span class="badge pending">进行中</span>';
+  const longest = longestSpan(result.blocked_spans);
   $("#overview").innerHTML = `
     <div class="metric"><b>流 ${mv.sid}：${mv.old_link} → ${mv.new_link}</b><span>被迁移的备份流</span></div>
     <div class="metric"><b>${outcomeBadge}</b><span>切换结果（回放结束落定）</span></div>
     <div class="metric"><b>L1 ${cfg.delay_l1_ms}ms / L2 ${cfg.delay_l2_ms}ms</b><span>两条链路单向延时</span></div>
-    <div class="metric"><b>时限 ${cfg.deadline_ms}ms · 窗口上限 ${cfg.new_link_cap}</b><span>切换从 ${cfg.handover_start_ms}ms 开始</span></div>`;
+    <div class="metric"><b>时限 ${cfg.deadline_ms}ms · 窗口上限 ${cfg.new_link_cap}</b><span>切换从 ${cfg.handover_start_ms}ms 开始</span></div>
+    <div class="metric"><b>${longest ? fmtMs(longest.duration_ms) : "无窗口打满"}</b><span>${longest ? `最长受阻时段（tick ${longest.first_tick}–${longest.last_tick}）` : "本次没有连续受阻时段"}</span></div>`;
+
+  renderEngineStats();
+  renderCompactTimeline();
+  renderSpanList();
 
   // ---- 泳道：每条流两行（L1/L2）
   const lanes = $("#lanes");
@@ -159,8 +192,34 @@ function setupScene() {
   renderChecks();
   $("#progress").style.width = "0%";
   $("#cap-meter").textContent = `0/${CAP}`;
+  $("#cap-meter").style.color = "";
   $("#deadline-meter").textContent = cfg.deadline_ms + " ms";
+  $("#deadline-meter").style.color = "";
   $("#clock").textContent = "0 ms";
+}
+
+function longestSpan(spans) {
+  if (!spans || !spans.length) return null;
+  return spans.reduce((a, b) => (b.duration_ms > a.duration_ms ? b : a));
+}
+
+function renderEngineStats() {
+  const s = result.stats || {};
+  const processed = s.processed_ticks ?? result.processed_ticks ?? "—";
+  const total = s.total_ticks ?? "—";
+  const skipped = s.skipped_ticks ?? "—";
+  const skipPct = (typeof skipped === "number" && total)
+    ? Math.round(100 * skipped / total) : 0;
+  const modeText = s.mode === "compact"
+    ? "紧凑模式（受阻段只记首末刻度）"
+    : "逐条事件模式（旧参数范围兼容输出）";
+  $("#engine-stats").innerHTML = `
+    <span class="stat">引擎实际处理刻度 <b>${processed}</b></span>
+    <span class="stat">时间线刻度槽位 <b>${total}</b></span>
+    <span class="stat">跳过空刻度 <b>${skipped}</b>（${skipPct}%）</span>
+    <span class="stat">压缩受阻段 <b>${(result.blocked_spans || []).length}</b></span>
+    <span class="stat">事件条数 <b>${result.events.length}</b></span>
+    <span class="stat mode">${modeText}</span>`;
 }
 
 function renderChecks() {
@@ -175,6 +234,174 @@ function renderChecks() {
   });
 }
 
+// ------------------------------------------------------------ 紧凑时间线
+function niceAxisStep(maxMs) {
+  const candidates = [250, 500, 1000, 2000, 5000, 10000, 15000,
+    30000, 60000, 120000, 300000];
+  for (const step of candidates) {
+    if (maxMs / step <= 12) return step;
+  }
+  return 600000;
+}
+
+function renderCompactTimeline() {
+  const ct = $("#compact-timeline");
+  ct.innerHTML = "";
+  const mvSid = result.handover.moving_stream;
+  const step = niceAxisStep(result.max_ts);
+
+  // ---- 时间轴行
+  const axisRow = document.createElement("div");
+  axisRow.className = "ct-row axis-row";
+  let ticksHtml = "";
+  for (let t = 0; t <= result.max_ts; t += step) {
+    ticksHtml += `<span class="ct-axis-tick" style="left:${pctOf(t)}%">${fmtMs(t)}</span>`;
+  }
+  axisRow.innerHTML = `<div class="ct-label">时间轴</div>
+    <div class="ct-track ct-axis">${ticksHtml}</div>`;
+  ct.appendChild(axisRow);
+
+  // ---- 每条流一行：发送/交付刻度 + 受阻红带 + 切换标记
+  result.streams.forEach((st) => {
+    const row = document.createElement("div");
+    row.className = "ct-row";
+    row.innerHTML = `<div class="ct-label" title="流 ${st.sid}">流 ${st.sid}${st.is_moving ? " 🚚" : ""}</div>
+      <div class="ct-track" id="ct-track-${st.sid}"></div>`;
+    ct.appendChild(row);
+    const track = row.querySelector(".ct-track");
+
+    // 发送 / 交付刻度（细竖线）
+    for (const ev of result.events) {
+      if (ev.stream !== st.sid) continue;
+      if (ev.type === "send") {
+        addMark(track, ev.ts, "ct-mark send",
+          `流${st.sid} #${ev.seq} 发送→${ev.link}（${ATTEMPT_TEXT[ev.attempt] || ev.attempt}）@${ev.ts}ms`);
+      } else if (ev.type === "deliver") {
+        addMark(track, ev.ts, "ct-mark deliver",
+          `流${st.sid} #${ev.seq} 交付（${ev.link}）@${ev.ts}ms`);
+      }
+    }
+
+    // 受阻时段红带
+    for (const sp of (result.blocked_spans || [])) {
+      if (sp.stream !== st.sid) continue;
+      // 首刻度 → 释放刻度(last+1) 构成完整受阻区间
+      const releaseMs = (sp.last_tick + 1) * TICK_MS;
+      const left = pctOf(sp.first_ts);
+      const width = pctOf(Math.min(releaseMs, result.max_ts)) - left;
+      const band = document.createElement("div");
+      band.className = "ct-band blocked";
+      band.dataset.startMs = sp.first_ts;
+      band.dataset.endMs = releaseMs;
+      band.style.left = left + "%";
+      band.style.width = Math.max(0.4, width) + "%";
+      band.title = `流${sp.stream} 窗口 [${sp.window.join(",")}] 满\n`
+        + `受阻 tick ${sp.first_tick}–${sp.last_tick}\n`
+        + `时间 ${fmtMs(sp.first_ts)}–${fmtMs(sp.last_ts)}（释放于 ${fmtMs(releaseMs)}）\n`
+        + `连续 ${sp.blocked_ticks} 个刻度（${fmtMs(sp.duration_ms)}）\n点击跳转到起点`;
+      const wide = width > 12;
+      band.innerHTML = wide
+        ? `<span class="ct-band-label">窗口满 [${sp.window.join(",")}] · ${fmtMs(sp.duration_ms)} · tick ${sp.first_tick}–${sp.last_tick}</span>`
+        : `<span class="ct-band-label short">#${sp.window[0]}… ·${sp.blocked_ticks}t</span>`;
+      band.addEventListener("click", () => jumpTo(sp.first_ts));
+      track.appendChild(band);
+    }
+
+    // 切换开始 / 成功 / 回退竖线（只标在迁移流行）
+    if (st.sid === mvSid) {
+      addMarker(track, result.config.handover_start_ms, "ct-marker start",
+        `切换开始 @${result.config.handover_start_ms}ms`);
+      if (result.handover.finish_ms != null) {
+        const okOutcome = result.handover.outcome === "success";
+        const cls = okOutcome ? "success" : "rollback";
+        addMarker(track, result.handover.finish_ms, `ct-marker ${cls}`,
+          `${okOutcome ? "切换成功" : "超时回退"} @${result.handover.finish_ms}ms`);
+      }
+    }
+
+    const head = document.createElement("div");
+    head.className = "ct-playhead";
+    track.appendChild(head);
+  });
+
+  // ---- 窗口占用阶梯条（迁移流）
+  const occRow = document.createElement("div");
+  occRow.className = "ct-row occ-row";
+  occRow.innerHTML = `<div class="ct-label">窗口占用<br><small>n/${CAP}</small></div>
+    <div class="ct-track occ-track" id="ct-occ"></div>`;
+  ct.appendChild(occRow);
+  const occ = occRow.querySelector(".occ-track");
+  const samples = result.window_occupancy || [];
+  for (let i = 0; i < samples.length; i++) {
+    const a = samples[i];
+    const b = samples[i + 1];
+    const endMs = b ? b.ts : result.max_ts;
+    if (endMs <= a.ts) continue;
+    const seg = document.createElement("div");
+    const ratio = a.size / CAP;
+    seg.className = "occ-seg " + (a.size >= CAP ? "full" : a.size > 0 ? "part" : "zero");
+    seg.style.left = pctOf(a.ts) + "%";
+    seg.style.width = Math.max(0, pctOf(endMs) - pctOf(a.ts)) + "%";
+    seg.style.height = Math.max(2, ratio * 100) + "%";
+    seg.title = `tick ${a.tick}（${fmtMs(a.ts)}）窗口占用 ${a.size}/${CAP} [${(a.window || []).join(",")}]`;
+    occ.appendChild(seg);
+  }
+  const capLine = document.createElement("div");
+  capLine.className = "occ-cap-line";
+  capLine.title = `窗口上限 ${CAP}`;
+  occ.appendChild(capLine);
+  const occHead = document.createElement("div");
+  occHead.className = "ct-playhead";
+  occ.appendChild(occHead);
+}
+
+function addMark(track, ms, cls, title) {
+  const m = document.createElement("span");
+  m.className = cls;
+  m.style.left = pctOf(ms) + "%";
+  m.title = title;
+  track.appendChild(m);
+}
+
+function addMarker(track, ms, cls, title) {
+  if (ms == null) return;
+  const m = document.createElement("span");
+  m.className = cls;
+  m.style.left = pctOf(ms) + "%";
+  m.title = title;
+  track.appendChild(m);
+}
+
+function renderSpanList() {
+  const box = $("#span-list");
+  const spans = result.blocked_spans || [];
+  if (!spans.length) {
+    box.innerHTML = `<span class="span-empty muted">本场景没有出现 4 包窗口打满的连续受阻时段。</span>`;
+    return;
+  }
+  box.innerHTML = spans.map((sp, i) => `
+    <button type="button" class="span-chip" data-start-ms="${sp.first_ts}">
+      <b>受阻段 ${i + 1}</b> · 流${sp.stream} 窗口 [${sp.window.join(",")}]
+      · tick <b>${sp.first_tick}–${sp.last_tick}</b>
+      · ${fmtMs(sp.first_ts)}–${fmtMs(sp.last_ts)}
+      · 持续 <b>${fmtMs(sp.duration_ms)}</b>（${sp.blocked_ticks} 刻度）
+      <span class="jump">跳转 ▸</span>
+    </button>`).join("");
+}
+
+function updateCompactPlayhead(nowMs) {
+  if (!result) return;
+  const x = pctOf(nowMs) + "%";
+  document.querySelectorAll("#compact-timeline .ct-playhead").forEach((h) => {
+    h.style.left = x;
+  });
+  document.querySelectorAll("#compact-timeline .ct-band.blocked").forEach((b) => {
+    const s = Number(b.dataset.startMs);
+    const e = Number(b.dataset.endMs);
+    b.classList.toggle("active", nowMs >= s && nowMs <= e);
+  });
+}
+
 // ------------------------------------------------------------ 播放控制
 function currentVirtual() {
   if (!result) return 0;
@@ -183,9 +410,10 @@ function currentVirtual() {
     startVirt + (performance.now() - startWall) * speed);
 }
 
-function play() {
+function play(fromMs = 0) {
+  cancelAnimationFrame(rafId);
   startWall = performance.now();
-  startVirt = 0;
+  startVirt = fromMs;
   if (speed === 0) { seek(result.max_ts); return; }
   const loop = () => {
     const now = currentVirtual();
@@ -193,6 +421,20 @@ function play() {
     if (now < result.max_ts) rafId = requestAnimationFrame(loop);
   };
   rafId = requestAnimationFrame(loop);
+}
+
+/* 跳转到任意虚拟时刻：完整重建场景后快进消费 ≤targetMs 的事件，
+ * 再从该时刻继续播放（用于点击受阻段）。 */
+function jumpTo(targetMs) {
+  if (!result) return;
+  setupScene();
+  const target = Math.max(0, Math.min(result.max_ts, targetMs));
+  while (evIndex < result.timeline.length && result.timeline[evIndex].ts <= target) {
+    applyEvent(result.timeline[evIndex]);
+    evIndex++;
+  }
+  seek(target);
+  play(target);
 }
 
 function seek(nowMs) {
@@ -203,6 +445,7 @@ function seek(nowMs) {
   }
   renderMotion(nowMs);
   renderMeters(nowMs);
+  updateCompactPlayhead(nowMs);
 }
 
 // ------------------------------------------------------------ 事件应用
@@ -212,22 +455,13 @@ function applyEvent(ev) {
   switch (ev.type) {
     case "send": {
       const key = pktKey(ev.stream, ev.seq);
-      if (!packets.has(key)) {
-        packets.set(key, {
-          stream: ev.stream, seq: ev.seq,
-          link: ev.link, attempt: ev.attempt,
-          sendMs: ev.ts, arriveMs: ev.arrive_ms,
-          state: "inflight", el: null,
-        });
-      } else {
-        // 同一编号重传（回退补发）：重建为旧链在途报文
-        packets.set(key, {
-          stream: ev.stream, seq: ev.seq,
-          link: ev.link, attempt: ev.attempt,
-          sendMs: ev.ts, arriveMs: ev.arrive_ms,
-          state: "inflight", el: null,
-        });
-      }
+      // 同一编号重传（回退补发）：重建为旧链在途报文；首发则新建
+      packets.set(key, {
+        stream: ev.stream, seq: ev.seq,
+        link: ev.link, attempt: ev.attempt,
+        sendMs: ev.ts, arriveMs: ev.arrive_ms,
+        state: "inflight", el: null,
+      });
       blockedSeqs.delete(key);
       break;
     }
@@ -251,7 +485,7 @@ function applyEvent(ev) {
       break;
     }
     case "send_blocked":
-      ev.window.forEach((seq) => blockedSeqs.add(pktKey(ev.stream, seq)));
+      (ev.window || []).forEach((seq) => blockedSeqs.add(pktKey(ev.stream, seq)));
       break;
     case "handover_start":
     case "handover_success":
@@ -275,8 +509,12 @@ function addDeliveryChip(ev) {
 function logRow(ev) {
   const log = $("#log");
   if (!log) return;
+
+  // 压缩模式每个受阻段有首/末两条事件：首条输出完整汇总，末条不重复刷屏
+  if (ev.type === "send_blocked" && ev.compressed && ev.edge === "last") return;
+
   const row = document.createElement("div");
-  row.className = "log-row " + ev.type;
+  row.className = "log-row " + ev.type + (ev.compressed ? " compressed-span" : "");
   const who = ev.stream ? `流${ev.stream} ` : "";
   let msg = TYPE_TEXT[ev.type] || ev.type;
   if (ev.type === "send") {
@@ -287,6 +525,10 @@ function logRow(ev) {
     msg += ` #${ev.seq}（经 ${ev.link}，${ATTEMPT_TEXT[ev.attempt]}）`;
   } else if (ev.type === "packet_discard") {
     msg += ` #${ev.seq}（${ev.link}）：${ev.reason}`;
+  } else if (ev.type === "send_blocked" && ev.compressed) {
+    msg += `：窗口内 [${ev.window.join(",")}] 相同且连续受阻，只记首末刻度 `
+      + `tick ${ev.first_tick}→${ev.last_tick}`
+      + `（${ev.first_ts}ms→${ev.last_ts}ms，共 ${ev.blocked_ticks} 刻度），等待交付腾出窗口或超时回退`;
   } else if (ev.type === "send_blocked") {
     msg += `：窗口内 ${ev.window.join(",")}，等待交付腾出窗口`;
   } else if (ev.type === "handover_start") {
@@ -360,17 +602,24 @@ function renderMeters(nowMs) {
   $("#clock").textContent = Math.round(nowMs) + " ms";
   $("#progress").style.width = (100 * nowMs / Math.max(1, result.max_ts)) + "%";
 
-  // 用事件重建当前新链窗口占用
+  // 优先用后端给的窗口占用采样取当前值；否则用事件重建
   let live = 0;
-  const peakKey = new Set();
-  for (const ev of result.timeline) {
-    if (ev.ts > nowMs) break;
-    if (ev.type === "send" && ev.attempt === "new-trial") peakKey.add(`${ev.stream}-${ev.seq}`);
-    if ((ev.type === "deliver" || ev.type === "packet_discard") && ev.attempt === "new-trial") {
-      peakKey.delete(`${ev.stream}-${ev.seq}`);
+  if (Array.isArray(result.window_occupancy) && result.window_occupancy.length) {
+    for (const s of result.window_occupancy) {
+      if (s.ts <= nowMs) live = s.size;
+      else break;
     }
+  } else {
+    const peakKey = new Set();
+    for (const ev of result.timeline) {
+      if (ev.ts > nowMs) break;
+      if (ev.type === "send" && ev.attempt === "new-trial") peakKey.add(`${ev.stream}-${ev.seq}`);
+      if ((ev.type === "deliver" || ev.type === "packet_discard") && ev.attempt === "new-trial") {
+        peakKey.delete(`${ev.stream}-${ev.seq}`);
+      }
+    }
+    live = peakKey.size;
   }
-  live = peakKey.size;
   $("#cap-meter").textContent = `${live}/${CAP}`;
   $("#cap-meter").style.color = live >= CAP ? "var(--bad)" : "";
 

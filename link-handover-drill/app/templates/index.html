@@ -27,14 +27,14 @@
     </div>
     <form id="cfg-form">
       <div class="grid4">
-        <label>链路 L1 延时 (ms)
+        <label>链路 L1 延时 (ms，{{ delay_min }}–{{ delay_max }})
           <input type="number" id="delay_l1_ms" min="{{ delay_min }}" max="{{ delay_max }}" step="50" value="200" required>
         </label>
-        <label>链路 L2 延时 (ms)
+        <label>链路 L2 延时 (ms，{{ delay_min }}–{{ delay_max }})
           <input type="number" id="delay_l2_ms" min="{{ delay_min }}" max="{{ delay_max }}" step="50" value="150" required>
         </label>
-        <label>切换时限 (ms)
-          <input type="number" id="deadline_ms" min="{{ deadline_min }}" max="{{ deadline_max }}" step="100" value="1200" required>
+        <label>切换时限 (ms，{{ deadline_min }}–{{ deadline_max }})
+          <input type="number" id="deadline_ms" min="{{ deadline_min }}" max="{{ deadline_max }}" step="50" value="1200" required>
         </label>
         <label>迁移哪条流
           <select id="moving_stream">
@@ -46,6 +46,11 @@
       <label class="pkts">每条流报文数（连续编号 1..N）
         <input type="number" id="packets_per_stream" min="1" max="50" value="14">
       </label>
+      <p class="muted range-hint">
+        延时与时限均可设到 <b>60000ms（60 秒）</b>，刻度仍为 50ms、发包间隔仍为 200ms。
+        参数在旧范围（延时 ≤{{ legacy_delay_max }}ms、时限 ≤{{ legacy_deadline_max }}ms）内时，
+        接口仍返回逐条事件；拉长到旧范围之外后自动启用紧凑时间线（受阻段只记首末刻度）。
+      </p>
       <div class="actions">
         <button type="submit" class="primary" id="run-btn">开始演练</button>
         <button type="button" id="replay-btn" disabled>↺ 重新播放</button>
@@ -54,6 +59,7 @@
           <button type="button" class="speed-btn" data-speed="1">1×</button>
           <button type="button" class="speed-btn active" data-speed="4">4×</button>
           <button type="button" class="speed-btn" data-speed="10">10×</button>
+          <button type="button" class="speed-btn" data-speed="60">60×</button>
           <button type="button" class="speed-btn" data-speed="0">瞬时</button>
         </span>
       </div>
@@ -73,9 +79,28 @@
       ｜ 时限剩余：<span id="deadline-meter">—</span></small>
   </section>
 
+  <!-- ================= 紧凑时间线（长时延主视图） ================= -->
+  <section class="card" id="compact-card" hidden>
+    <h2>③ 紧凑时间线：窗口卡在什么时段（红带 = 窗口满连续受阻，点击可跳转）</h2>
+    <div class="engine-stats" id="engine-stats"></div>
+    <div class="ct-scroll">
+      <div class="ct" id="compact-timeline"></div>
+    </div>
+    <div class="ct-span-list" id="span-list"></div>
+    <div class="legend">
+      <span><i class="ct-swatch blocked"></i>窗口满、仅暂停迁移流</span>
+      <span><i class="ct-swatch occ"></i>窗口占用 n/{{ cap }}</span>
+      <span><i class="ct-line start"></i>切换开始</span>
+      <span><i class="ct-line success"></i>切换成功</span>
+      <span><i class="ct-line rollback"></i>超时回退</span>
+      <span><i class="ct-tick send"></i>发送时刻</span>
+      <span><i class="ct-tick deliver"></i>交付时刻</span>
+    </div>
+  </section>
+
   <!-- ================= 链路与流 ================= -->
   <section class="card" id="lanes-card" hidden>
-    <h2>③ 报文动态（点 = 单个报文，颜色表示所走链路与状态）</h2>
+    <h2>④ 报文动态（点 = 单个报文，颜色表示所走链路与状态）</h2>
     <div id="lanes"></div>
     <div class="legend">
       <span><i class="dot l1"></i>L1 链路</span>
@@ -88,25 +113,25 @@
 
   <!-- ================= 交付顺序 ================= -->
   <section class="card" id="delivery-card" hidden>
-    <h2>④ 交付给应用的顺序（编号 / 链路 / 尝试方式）</h2>
+    <h2>⑤ 交付给应用的顺序（编号 / 链路 / 尝试方式）</h2>
     <div id="delivery"></div>
   </section>
 
   <!-- ================= 事件日志 ================= -->
   <section class="card" id="log-card" hidden>
-    <h2>⑤ 事件时间线</h2>
+    <h2>⑥ 事件时间线</h2>
     <div id="log" class="log"></div>
   </section>
 
   <!-- ================= 自检结果 ================= -->
   <section class="card" id="checks-card" hidden>
-    <h2>⑥ 交付正确性自检</h2>
+    <h2>⑦ 交付正确性自检</h2>
     <ul id="checks"></ul>
   </section>
 </main>
 
 <footer>
-  <small class="muted">本地演练工具 · 确定性离散事件模拟（tick = 50ms，发包间隔 200ms）· 无外部依赖</small>
+  <small class="muted">本地演练工具 · 确定性离散事件模拟（tick = 50ms，发包间隔 200ms；长时延自动跳空刻度）· 无外部依赖</small>
 </footer>
 
 <script>
