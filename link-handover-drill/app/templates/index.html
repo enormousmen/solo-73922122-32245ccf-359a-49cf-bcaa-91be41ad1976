@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>机房链路切换演练 · 备份流迁移沙盘</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>机房链路切换演练沙盘</h1>
+  <p class="sub">
+    备份流 make-before-break 迁移 · 旧链排空后才放行新链 ·
+    新链未交付上限 <b>{{ cap }}</b> 包（满额仅暂停本流）·
+    超时回退旧链补发、丢弃新链迟到副本 · 按编号交付、每包恰好一次
+  </p>
+</header>
+
+<main>
+  <!-- ================= 控制面板 ================= -->
+  <section class="card">
+    <h2>① 参数设置</h2>
+    <div class="presets">
+      {% for key, p in presets.items() %}
+      <button class="preset-btn" data-preset="{{ key }}">{{ p.label }}</button>
+      {% endfor %}
+    </div>
+    <form id="cfg-form">
+      <div class="grid4">
+        <label>链路 L1 延时 (ms)
+          <input type="number" id="delay_l1_ms" min="{{ delay_min }}" max="{{ delay_max }}" step="50" value="200" required>
+        </label>
+        <label>链路 L2 延时 (ms)
+          <input type="number" id="delay_l2_ms" min="{{ delay_min }}" max="{{ delay_max }}" step="50" value="150" required>
+        </label>
+        <label>切换时限 (ms)
+          <input type="number" id="deadline_ms" min="{{ deadline_min }}" max="{{ deadline_max }}" step="100" value="1200" required>
+        </label>
+        <label>迁移哪条流
+          <select id="moving_stream">
+            <option value="1">流 1（默认走 L1 → 移到 L2）</option>
+            <option value="2">流 2（默认走 L2 → 移到 L1）</option>
+          </select>
+        </label>
+      </div>
+      <label class="pkts">每条流报文数（连续编号 1..N）
+        <input type="number" id="packets_per_stream" min="1" max="50" value="14">
+      </label>
+      <div class="actions">
+        <button type="submit" class="primary" id="run-btn">开始演练</button>
+        <button type="button" id="replay-btn" disabled>↺ 重新播放</button>
+        <span class="speed">
+          播放速度
+          <button type="button" class="speed-btn" data-speed="1">1×</button>
+          <button type="button" class="speed-btn active" data-speed="4">4×</button>
+          <button type="button" class="speed-btn" data-speed="10">10×</button>
+          <button type="button" class="speed-btn" data-speed="0">瞬时</button>
+        </span>
+      </div>
+      <p id="form-error" class="error" hidden></p>
+    </form>
+  </section>
+
+  <!-- ================= 状态总览 ================= -->
+  <section class="card" id="overview-card" hidden>
+    <h2>② 切换总览</h2>
+    <div class="grid4" id="overview"></div>
+    <div class="progress-wrap">
+      <div class="progress" id="progress"></div>
+    </div>
+    <small class="muted">虚拟时间 <span id="clock">0 ms</span> / <span id="clock-total">—</span>
+      ｜ 新链未交付窗口：<span id="cap-meter">0/{{ cap }}</span>
+      ｜ 时限剩余：<span id="deadline-meter">—</span></small>
+  </section>
+
+  <!-- ================= 链路与流 ================= -->
+  <section class="card" id="lanes-card" hidden>
+    <h2>③ 报文动态（点 = 单个报文，颜色表示所走链路与状态）</h2>
+    <div id="lanes"></div>
+    <div class="legend">
+      <span><i class="dot l1"></i>L1 链路</span>
+      <span><i class="dot l2"></i>L2 链路</span>
+      <span><i class="dot held"></i>新链已到、等待旧链排空</span>
+      <span><i class="dot delivered"></i>已按编号交付应用</span>
+      <span><i class="dot discarded"></i>丢弃（迟到副本/回退作废）</span>
+    </div>
+  </section>
+
+  <!-- ================= 交付顺序 ================= -->
+  <section class="card" id="delivery-card" hidden>
+    <h2>④ 交付给应用的顺序（编号 / 链路 / 尝试方式）</h2>
+    <div id="delivery"></div>
+  </section>
+
+  <!-- ================= 事件日志 ================= -->
+  <section class="card" id="log-card" hidden>
+    <h2>⑤ 事件时间线</h2>
+    <div id="log" class="log"></div>
+  </section>
+
+  <!-- ================= 自检结果 ================= -->
+  <section class="card" id="checks-card" hidden>
+    <h2>⑥ 交付正确性自检</h2>
+    <ul id="checks"></ul>
+  </section>
+</main>
+
+<footer>
+  <small class="muted">本地演练工具 · 确定性离散事件模拟（tick = 50ms，发包间隔 200ms）· 无外部依赖</small>
+</footer>
+
+<script>
+window.PRESETS = {{ presets | tojson }};
+window.NEW_LINK_CAP = {{ cap }};
+</script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
